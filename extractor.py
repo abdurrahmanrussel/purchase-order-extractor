@@ -46,7 +46,7 @@ def extract_po_info(pdf_path: str) -> dict:
         }
 
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e)} 
 
 
 def extract_item_blocks(pdf_path: str):

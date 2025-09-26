@@ -238,7 +238,7 @@ def main():
         },
         hide_index=True,
         key="data_editor",
-        use_container_width=True
+        width="stretch"   # ✅ replaces use_container_width=True
     )
 
     st.session_state.df_display = edited_df
@@ -256,7 +256,7 @@ def main():
             data=file_data,
             file_name="Extracted_Selected.csv",
             mime="text/csv",
-            use_container_width=True
+            width="stretch"   # ✅ replaces use_container_width=True
         )
 
 if __name__ == "__main__":
