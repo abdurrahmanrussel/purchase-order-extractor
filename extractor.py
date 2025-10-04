@@ -35,6 +35,7 @@ def extract_po_info(pdf_path: str) -> dict:
         payment_match = re.search(r"Payment Term:\s*(.+)", full_text)
         payment_term = payment_match.group(1).strip() if payment_match else ""
 
+        # Document Date (PO_Issue Date)
         doc_date_match = re.search(r"\b\d{2}/\d{2}/\d{4}\b", full_text)
         document_date = doc_date_match.group(0) if doc_date_match else ""
 
@@ -46,11 +47,30 @@ def extract_po_info(pdf_path: str) -> dict:
         }
 
     except Exception as e:
-        return {"error": str(e)} 
+        return {"error": str(e)}
 
 
+# -----------------------------
+# Clean description logic
+# -----------------------------
+def clean_description(desc):
+    desc = desc.strip()
+    words = desc.split()
+    for length in range(len(words)//2, 0, -1):  # check longest possible substring first
+        start_sub = " ".join(words[:length])
+        end_sub = " ".join(words[-length:])
+        if start_sub.lower() == end_sub.lower():  # repeated substring
+            middle = " ".join(words[length:-length])
+            # Check if middle contains "Each" or floating point numbers
+            if re.search(r'\bEach\b', middle, flags=re.IGNORECASE) or re.search(r'\d+\.\d+', middle):
+                return max(start_sub, end_sub, key=len).strip()
+    return desc
+
+
+# -----------------------------
+# Extract item blocks
+# -----------------------------
 def extract_item_blocks(pdf_path: str):
-    """Extract item details from PDF table blocks."""
     try:
         doc = fitz.open(pdf_path)
         full_text = ""
@@ -62,7 +82,7 @@ def extract_item_blocks(pdf_path: str):
                 full_text += block[4] + "\n"
         doc.close()
 
-        # Remove commas in numbers (e.g., 1,000 → 1000)
+        # Remove commas in numbers
         full_text = re.sub(r'(?<=\d),(?=\d)', '', full_text)
         lines = full_text.splitlines()
         stop_marker = "▌Tax Details"
@@ -71,12 +91,15 @@ def extract_item_blocks(pdf_path: str):
         blocks = []
         current_block = []
         waiting_for_date = False
-        prev_line = ""
+        prev_line = ""  # for multi-line start marker
         start_marker_found = False
 
         for line in lines:
             line_strip = line.strip()
 
+            # --------------------
+            # Find start marker
+            # --------------------
             if not inside_table:
                 combined = (prev_line + line_strip).replace(" ", "")
                 if combined == "Tax%Tax%":
@@ -90,10 +113,17 @@ def extract_item_blocks(pdf_path: str):
                 prev_line = line_strip
                 continue
 
+            # --------------------
+            # Stop marker
+            # --------------------
             if line_strip.startswith(stop_marker):
-                break
+                inside_table = False
+                continue
 
-            current_block.append(line)
+            # --------------------
+            # Collect block lines
+            # --------------------
+            current_block.append(line_strip)
 
             if line_strip.startswith("Delivery Date:"):
                 waiting_for_date = True
@@ -102,7 +132,16 @@ def extract_item_blocks(pdf_path: str):
             if waiting_for_date:
                 if re.match(r"\d{1,2}/\d{1,2}/\d{4}", line_strip):
                     current_block.append(line_strip)
-                    blocks.append(parse_block(current_block))
+                    # If block contains "page", ignore and restart searching for start marker
+                    if any(re.search(r'page', l, re.IGNORECASE) for l in current_block):
+                        current_block = []
+                        waiting_for_date = False
+                        inside_table = False
+                        prev_line = ""
+                        continue
+                    # Otherwise, parse normally
+                    data = parse_block(current_block)
+                    blocks.append(data)
                     current_block = []
                     waiting_for_date = False
 
@@ -114,8 +153,10 @@ def extract_item_blocks(pdf_path: str):
         return {"error": str(e)}
 
 
-def parse_block(block_lines: list) -> dict:
-    """Parse individual block of item details."""
+# -----------------------------
+# Parse block and clean description
+# -----------------------------
+def parse_block(block_lines):
     data = {
         "Item_Code": "",
         "Delivery Date": "",
@@ -134,9 +175,11 @@ def parse_block(block_lines: list) -> dict:
             break
 
     # Item Code
+    item_code_index = -1
     for i, line in enumerate(block_lines):
         if line.strip().startswith("Item Code:") and i + 1 < len(block_lines):
             data["Item_Code"] = block_lines[i+1].strip()
+            item_code_index = i+1
             break
 
     # Price & Total
@@ -149,7 +192,7 @@ def parse_block(block_lines: list) -> dict:
     try:
         if data["Price"] and data["Total"]:
             data["Quantity"] = str(round(float(data["Total"]) / float(data["Price"]), 4))
-    except ZeroDivisionError:
+    except:
         data["Quantity"] = ""
 
     # Detect UoM
@@ -158,38 +201,32 @@ def parse_block(block_lines: list) -> dict:
             data["UoM(optional)"] = "Each"
             break
 
-    # Description & Item Details
-    candidates = []
-    ignore_patterns = [r"^\d+\.\d+$", r"^Each$", r"Delivery Date:", r"Item Code:"]
-    for line in block_lines:
+    # Item Details (new logic)
+    rev_index = -1
+    for i, line in enumerate(block_lines):
         line_strip = line.strip()
-        if not any(re.match(p, line_strip) for p in ignore_patterns) and line_strip not in [data["Price"], data["Total"], data["Delivery Date"], data["Item_Code"]]:
-            candidates.append(line_strip)
-
-    seen = {}
-    duplicates = []
-    for line in candidates:
-        if line in seen:
-            duplicates.append(line)
-        else:
-            seen[line] = 1
-
-    data["Description"] = " ".join(duplicates).strip()
-
-    for line in block_lines:
-        line_strip = line.strip()
-        if line_strip in [data["Price"], data["Total"], data["Quantity"], data["Delivery Date"], "Each", data["Item_Code"]]:
-            continue
-        if line_strip.startswith(("Delivery Date:", "Item Code:")):
-            continue
-        if line_strip in duplicates:
-            continue
-        try:
-            float(line_strip)
-            continue
-        except ValueError:
+        if re.match(r"^(Rev|REV)\s+\w+", line_strip):
             data["Item Details"] = line_strip
+            rev_index = i
             break
+
+    # Description (cleaned)
+    if item_code_index != -1:
+        if rev_index != -1:
+            desc_lines = block_lines[rev_index+1:item_code_index]
+        else:
+            int_index = -1
+            for j in range(item_code_index-1, -1, -1):
+                if re.match(r"^\d+$", block_lines[j].strip()):
+                    int_index = j
+                    break
+            if int_index != -1:
+                desc_lines = block_lines[int_index+1:item_code_index]
+            else:
+                desc_lines = block_lines[:item_code_index]
+        desc_lines = [l for l in desc_lines if not l.strip().startswith("Item Code:")]
+        combined_desc = " ".join([l.strip() for l in desc_lines if l.strip()])
+        data["Description"] = clean_description(combined_desc)
 
     return data
 
